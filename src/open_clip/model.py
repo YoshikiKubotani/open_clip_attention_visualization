@@ -292,6 +292,9 @@ class CLIP(nn.Module):
         text_logits = image_logits.T
         return image_logits, text_logits
 
+    def get_attention_weights_dict(self, image: torch.Tensor):
+        return self.visual.get_all_layers_attention_weights(image)
+
     def forward(
             self,
             image: Optional[torch.Tensor] = None,

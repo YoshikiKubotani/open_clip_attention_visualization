@@ -250,6 +250,21 @@ class ResidualAttentionBlock(nn.Module):
             q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask
         )[0]
 
+    def attention_all(
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+    ):
+        k_x = k_x if k_x is not None else q_x
+        v_x = v_x if v_x is not None else q_x
+
+        attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
+        return self.attn(
+            q_x, k_x, v_x, need_weights=True, average_attn_weights=True, attn_mask=attn_mask
+        )
+
     def forward(
             self,
             q_x: torch.Tensor,
@@ -262,6 +277,20 @@ class ResidualAttentionBlock(nn.Module):
         x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
         return x
+
+    def forward_all(
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+    ):
+        k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
+        v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
+        attn_output, attn_output_weights = self.attention_all(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask)
+        x = q_x + self.ls_1(attn_output)
+        x = x + self.ls_2(self.mlp(self.ln_2(x)))
+        return x, attn_output_weights
 
 
 class CustomResidualAttentionBlock(nn.Module):
@@ -346,6 +375,21 @@ class Transformer(nn.Module):
         if hasattr(self.resblocks[0].mlp.c_fc, 'int8_original_dtype'):
             return self.resblocks[0].mlp.c_fc.int8_original_dtype
         return self.resblocks[0].mlp.c_fc.weight.dtype
+
+    def get_all_layers_attention_weights(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+        x = x.transpose(0, 1).contiguous()    # NLD -> LND
+        attention_weights = {}
+        for idx, layer in enumerate(self.resblocks):
+            # 今欲しいのは各層のattn_output_weights。それにはforward_allの計算が必要。それにはxが必要。
+            # xはひとつ前の層の出力。最初はxは入力。
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
+                x, attn_output_weights = checkpoint(layer, x, None, None, attn_mask)
+            else:
+                x, attn_output_weights = layer.forward_all(x, attn_mask=attn_mask)
+            x = x.transpose(0, 1)    # LND -> NLD
+            attention_weights["layer" + str(idx)] = attn_output_weights
+        return attention_weights
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
         x = x.transpose(0, 1).contiguous()    # NLD -> LND
@@ -598,6 +642,20 @@ class VisionTransformer(nn.Module):
 
         return pooled, tokens
 
+    def get_all_layers_attention_weights(self, x: torch.Tensor):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+        # class embeddings and positional embeddings
+        x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
+        # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+
+        x = self.patch_dropout(x)
+        x = self.ln_pre(x)
+        return self.transformer.get_all_layers_attention_weights(x)
+
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -639,7 +697,7 @@ class VisionTransformer(nn.Module):
 
         if self.output_tokens:
             return pooled, tokens
-        
+
         return pooled
 
 
